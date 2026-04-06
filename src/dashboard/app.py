@@ -22,20 +22,38 @@ st.set_page_config(
 # ── Initialize clients ────────────────────────────────────
 @st.cache_resource
 def get_clients():
-    openai_client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY") or
-        st.secrets.get("OPENAI_API_KEY", "")
-    )
-    pc = Pinecone(
-        api_key=os.getenv("PINECONE_API_KEY") or
-        st.secrets.get("PINECONE_API_KEY", "")
-    )
-    index = pc.Index(
-        os.getenv("PINECONE_INDEX") or
-        st.secrets.get("PINECONE_INDEX", "market-intel")
-    )
-    return openai_client, index
+    # On Streamlit Cloud secrets are in st.secrets
+    # Locally they are in .env file
+    try:
+        openai_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
 
+    try:
+        pinecone_key = st.secrets["PINECONE_API_KEY"]
+    except Exception:
+        pinecone_key = os.getenv("PINECONE_API_KEY", "")
+
+    try:
+        pinecone_index_name = st.secrets["PINECONE_INDEX"]
+    except Exception:
+        pinecone_index_name = os.getenv(
+            "PINECONE_INDEX", "market-intel"
+        )
+
+    if not openai_key:
+        st.error("OPENAI_API_KEY not found in secrets!")
+        st.stop()
+
+    if not pinecone_key:
+        st.error("PINECONE_API_KEY not found in secrets!")
+        st.stop()
+
+    openai_client = OpenAI(api_key=openai_key)
+    pc            = Pinecone(api_key=pinecone_key)
+    index         = pc.Index(pinecone_index_name)
+
+    return openai_client, index
 
 def get_embedding(text: str, client: OpenAI) -> list:
     """Convert text to vector embedding."""
