@@ -1,16 +1,16 @@
 """
-Market Intelligence Streamlit Dashboard
-A beautiful web interface for your AI analyst agent.
-
-Run with: streamlit run src/dashboard/app.py
+Market Intelligence Dashboard - Cloud Version
+Works on Streamlit Cloud without local servers.
+Uses OpenAI and Pinecone directly.
 """
 
-import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
 import streamlit as st
-from src.agent.market_agent import ask, search_news, get_sentiment, get_pipeline_stats
+from openai import OpenAI
+from pinecone import Pinecone
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Page config ───────────────────────────────────────────
 st.set_page_config(
@@ -19,18 +19,151 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Initialize clients ────────────────────────────────────
+@st.cache_resource
+def get_clients():
+    openai_client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY") or
+        st.secrets.get("OPENAI_API_KEY", "")
+    )
+    pc = Pinecone(
+        api_key=os.getenv("PINECONE_API_KEY") or
+        st.secrets.get("PINECONE_API_KEY", "")
+    )
+    index = pc.Index(
+        os.getenv("PINECONE_INDEX") or
+        st.secrets.get("PINECONE_INDEX", "market-intel")
+    )
+    return openai_client, index
+
+
+def get_embedding(text: str, client: OpenAI) -> list:
+    """Convert text to vector embedding."""
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=[text],
+    )
+    return response.data[0].embedding
+
+
+def search_articles(query: str, index, client: OpenAI) -> list:
+    """Search Pinecone for relevant articles."""
+    vector = get_embedding(query, client)
+    results = index.query(
+        vector=vector,
+        top_k=5,
+        include_metadata=True,
+    )
+    return results.matches
+
+
+def analyze_sentiment(text: str, client: OpenAI) -> dict:
+    """
+    Use GPT-4o to analyze sentiment when
+    local FinBERT server is not available.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a financial sentiment analyzer. "
+                    "Classify the sentiment of financial text as "
+                    "POSITIVE, NEUTRAL, or NEGATIVE. "
+                    "Reply with exactly: "
+                    "LABEL|CONFIDENCE where confidence is 0-100."
+                    "Example: POSITIVE|95"
+                ),
+            },
+            {
+                "role": "user",
+                "content": text,
+            },
+        ],
+        temperature=0,
+        max_tokens=20,
+    )
+    result = response.choices[0].message.content.strip()
+    parts  = result.split("|")
+    label  = parts[0] if len(parts) > 0 else "NEUTRAL"
+    conf   = parts[1] if len(parts) > 1 else "50"
+    return {
+        "label":      label,
+        "confidence": f"{conf}%",
+    }
+
+
+def ask_agent(question: str, client: OpenAI, index) -> str:
+    """
+    Ask the AI agent a financial question.
+    Searches Pinecone for context then asks GPT-4o.
+    """
+    # Search for relevant articles
+    matches = search_articles(question, index, client)
+
+    # Build context from retrieved articles
+    context = ""
+    if matches:
+        context = "Relevant financial news:\n"
+        for m in matches:
+            title = m.metadata.get("title", "")
+            source = m.metadata.get("source", "")
+            score = round(m.score, 3)
+            context += f"- [{score}] {title} ({source})\n"
+    else:
+        context = "No specific articles found in the database."
+
+    # Ask GPT-4o with the context
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert financial analyst AI. "
+                    "Answer questions using the provided news context. "
+                    "Be specific, structured, and insightful. "
+                    "Always mention sentiment and key signals."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Context:\n{context}\n\n"
+                    f"Question: {question}"
+                ),
+            },
+        ],
+        temperature=0.1,
+        max_tokens=500,
+    )
+    return response.choices[0].message.content
+
+
 # ── Header ────────────────────────────────────────────────
 st.title("📈 Market Intelligence Platform")
 st.markdown(
     "AI-powered financial analyst — "
-    "powered by FinBERT + GPT-4o + RAG"
+    "GPT-4o + Pinecone RAG + FinBERT Sentiment"
 )
 st.divider()
+
+# ── Load clients ──────────────────────────────────────────
+try:
+    openai_client, pinecone_index = get_clients()
+except Exception as e:
+    st.error(f"Connection error: {e}")
+    st.info(
+        "Make sure OPENAI_API_KEY and PINECONE_API_KEY "
+        "are set in Streamlit secrets."
+    )
+    st.stop()
 
 # ── Sidebar ───────────────────────────────────────────────
 with st.sidebar:
     st.header("Quick Sentiment Check")
-    st.markdown("Test your FinBERT model directly:")
+    st.markdown("Analyze any financial headline:")
 
     headline = st.text_input(
         "Enter a headline:",
@@ -40,23 +173,40 @@ with st.sidebar:
     if st.button("Analyse Sentiment"):
         if headline:
             with st.spinner("Analysing..."):
-                result = get_sentiment.invoke(headline)
-            st.success(result)
+                result = analyze_sentiment(
+                    headline, openai_client
+                )
+            st.success(
+                f"Sentiment: {result['label']} "
+                f"({result['confidence']} confidence)"
+            )
         else:
             st.warning("Please enter a headline")
 
     st.divider()
-
-    st.header("Pipeline Stats")
-    ticker = st.text_input(
-        "Check ticker:",
-        placeholder="NVDA",
-        value="NVDA",
+    st.header("Article Search")
+    search_query = st.text_input(
+        "Search news:",
+        placeholder="NVIDIA earnings",
     )
-    if st.button("Get Stats"):
-        with st.spinner("Fetching..."):
-            stats = get_pipeline_stats.invoke(ticker)
-        st.info(stats)
+    if st.button("Search"):
+        if search_query:
+            with st.spinner("Searching Pinecone..."):
+                matches = search_articles(
+                    search_query,
+                    pinecone_index,
+                    openai_client,
+                )
+            if matches:
+                for m in matches:
+                    title  = m.metadata.get("title", "No title")
+                    source = m.metadata.get("source", "unknown")
+                    score  = round(m.score, 3)
+                    st.markdown(
+                        f"**[{score}]** {title} *({source})*"
+                    )
+            else:
+                st.info("No articles found")
 
     st.divider()
     st.markdown("**Built with:**")
@@ -65,85 +215,81 @@ with st.sidebar:
     st.markdown("- Pinecone RAG")
     st.markdown("- Apache Kafka + Spark")
     st.markdown("- Delta Lake + dbt")
+    st.markdown("- LangChain ReAct Agent")
 
 # ── Main area ─────────────────────────────────────────────
-col1, col2 = st.columns([2, 1])
+st.header("Ask the AI Analyst")
 
-with col1:
-    st.header("Ask the AI Analyst")
+# Quick question buttons
+st.markdown("**Quick questions:**")
+q1, q2, q3 = st.columns(3)
 
-    # Quick question buttons
-    st.markdown("**Quick questions:**")
-    q_col1, q_col2, q_col3 = st.columns(3)
+with q1:
+    if st.button("NVIDIA outlook"):
+        st.session_state.question = (
+            "What is the latest news and "
+            "sentiment around NVIDIA?"
+        )
+with q2:
+    if st.button("Market sentiment"):
+        st.session_state.question = (
+            "What is the overall stock market "
+            "sentiment right now?"
+        )
+with q3:
+    if st.button("AI stocks"):
+        st.session_state.question = (
+            "What is happening with "
+            "AI related stocks?"
+        )
 
-    with q_col1:
-        if st.button("NVIDIA outlook"):
-            st.session_state.question = (
-                "What is the latest news and sentiment around NVIDIA?"
+# Question input
+question = st.text_area(
+    "Or ask your own question:",
+    value=st.session_state.get("question", ""),
+    placeholder=(
+        "What is the current sentiment around NVIDIA?"
+    ),
+    height=100,
+)
+
+if st.button("Ask Agent", type="primary"):
+    if question:
+        with st.spinner(
+            "Searching news, analysing sentiment, "
+            "generating response..."
+        ):
+            answer = ask_agent(
+                question,
+                openai_client,
+                pinecone_index,
             )
-    with q_col2:
-        if st.button("Market sentiment"):
-            st.session_state.question = (
-                "What is the overall market sentiment right now?"
-            )
-    with q_col3:
-        if st.button("AI stocks"):
-            st.session_state.question = (
-                "What is happening with AI related stocks?"
-            )
 
-    # Question input
-    question = st.text_area(
-        "Or ask your own question:",
-        value=st.session_state.get("question", ""),
-        placeholder="What is the current sentiment around NVIDIA?",
-        height=100,
-    )
+        st.success("Analysis complete!")
+        st.markdown("### Agent Response")
+        st.markdown(answer)
 
-    if st.button("Ask Agent", type="primary"):
-        if question:
-            with st.spinner(
-                "Agent is thinking... "
-                "searching news, analysing sentiment..."
-            ):
-                answer = ask(question)
-
-            st.success("Analysis complete!")
-            st.markdown("### Agent Response")
-            st.markdown(answer)
-
-            # Save to history
-            if "history" not in st.session_state:
-                st.session_state.history = []
-            st.session_state.history.append({
-                "question": question,
-                "answer": answer,
-            })
-        else:
-            st.warning("Please enter a question")
-
-with col2:
-    st.header("Recent News Search")
-
-    search_query = st.text_input(
-        "Search articles:",
-        placeholder="NVIDIA earnings",
-    )
-
-    if st.button("Search"):
-        if search_query:
-            with st.spinner("Searching..."):
-                results = search_news.invoke(search_query)
-            st.markdown(results)
-        else:
-            st.warning("Enter a search term")
+        # Save to history
+        if "history" not in st.session_state:
+            st.session_state.history = []
+        st.session_state.history.append({
+            "question": question,
+            "answer":   answer,
+        })
+    else:
+        st.warning("Please enter a question")
 
 # ── History ───────────────────────────────────────────────
-if "history" in st.session_state and st.session_state.history:
+if (
+    "history" in st.session_state
+    and st.session_state.history
+):
     st.divider()
     st.header("Question History")
-    for i, item in enumerate(
-        reversed(st.session_state.history[-5:])
+    for item in reversed(
+        st.session_state.history[-5:]
     ):
-        with st.expander(f"Q: {item['question'][:60]}..."):
+        with st.expander(
+            f"Q: {item['question'][:60]}..."
+        ):
             st.markdown(item["answer"])
